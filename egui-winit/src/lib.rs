@@ -194,25 +194,37 @@ impl State {
                     winit::event::TouchPhase::Moved => egui_ctx.is_using_pointer(),
                 }
             }
-            WindowEvent::ReceivedCharacter(ch) => {
-                // On Mac we get here when the user presses Cmd-C (copy), ctrl-W, etc.
-                // We need to ignore these characters that are side-effects of commands.
-                let is_mac_cmd = cfg!(target_os = "macos")
-                    && (self.egui_input.modifiers.ctrl || self.egui_input.modifiers.mac_cmd);
-
-                if is_printable_char(*ch) && !is_mac_cmd {
-                    self.egui_input
-                        .events
-                        .push(egui::Event::Text(ch.to_string()));
-                    egui_ctx.wants_keyboard_input()
-                } else {
-                    false
-                }
+            WindowEvent::Ime(winit::event::Ime::Commit(text)) => {
+                self.egui_input.events.push(egui::Event::Text(text.clone()));
+                true
             }
-            WindowEvent::KeyboardInput { input, .. } => {
-                self.on_keyboard_input(input);
-                egui_ctx.wants_keyboard_input()
-                    || input.virtual_keycode == Some(winit::event::VirtualKeyCode::Tab)
+            WindowEvent::KeyboardInput { event, .. } => {
+                self.on_keyboard_input(event);
+                let key_consumed = egui_ctx.wants_keyboard_input()
+                    || event.logical_key == winit::keyboard::Key::Tab;
+
+                if !key_consumed {
+                    if let Some(text) = event.text {
+                        // On Mac we get here when the user presses Cmd-C (copy), ctrl-W, etc.
+                        // We need to ignore these characters that are side-effects of commands.
+                        let is_mac_cmd = cfg!(target_os = "macos")
+                            && (self.egui_input.modifiers.ctrl
+                                || self.egui_input.modifiers.mac_cmd);
+
+                        if text.chars().all(is_printable_char) && !is_mac_cmd {
+                            self.egui_input
+                                .events
+                                .push(egui::Event::Text(text.to_string()));
+                            egui_ctx.wants_keyboard_input()
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    }
+                } else {
+                    true
+                }
             }
             WindowEvent::Focused(_) => {
                 // We will not be given a KeyboardInput event when the modifiers are released while
@@ -240,14 +252,14 @@ impl State {
                 false
             }
             WindowEvent::ModifiersChanged(state) => {
-                self.egui_input.modifiers.alt = state.alt();
-                self.egui_input.modifiers.ctrl = state.ctrl();
-                self.egui_input.modifiers.shift = state.shift();
-                self.egui_input.modifiers.mac_cmd = cfg!(target_os = "macos") && state.logo();
+                self.egui_input.modifiers.alt = state.alt_key();
+                self.egui_input.modifiers.ctrl = state.control_key();
+                self.egui_input.modifiers.shift = state.shift_key();
+                self.egui_input.modifiers.mac_cmd = cfg!(target_os = "macos") && state.super_key();
                 self.egui_input.modifiers.command = if cfg!(target_os = "macos") {
-                    state.logo()
+                    state.super_key()
                 } else {
-                    state.ctrl()
+                    state.control_key()
                 };
                 false
             }
@@ -421,34 +433,33 @@ impl State {
         }
     }
 
-    fn on_keyboard_input(&mut self, input: &winit::event::KeyboardInput) {
-        if let Some(keycode) = input.virtual_keycode {
-            let pressed = input.state == winit::event::ElementState::Pressed;
+    fn on_keyboard_input(&mut self, event: &winit::event::KeyEvent) {
+        let keycode = event.logical_key;
+        let pressed = event.state == winit::event::ElementState::Pressed;
 
-            if pressed {
-                // VirtualKeyCode::Paste etc in winit are broken/untrustworthy,
-                // so we detect these things manually:
-                if is_cut_command(self.egui_input.modifiers, keycode) {
-                    self.egui_input.events.push(egui::Event::Cut);
-                } else if is_copy_command(self.egui_input.modifiers, keycode) {
-                    self.egui_input.events.push(egui::Event::Copy);
-                } else if is_paste_command(self.egui_input.modifiers, keycode) {
-                    if let Some(contents) = self.clipboard.get() {
-                        let contents = contents.replace("\r\n", "\n");
-                        if !contents.is_empty() {
-                            self.egui_input.events.push(egui::Event::Paste(contents));
-                        }
+        if pressed {
+            // WinitKey::Paste etc in winit are broken/untrustworthy,
+            // so we detect these things manually:
+            if is_cut_command(self.egui_input.modifiers, keycode) {
+                self.egui_input.events.push(egui::Event::Cut);
+            } else if is_copy_command(self.egui_input.modifiers, keycode) {
+                self.egui_input.events.push(egui::Event::Copy);
+            } else if is_paste_command(self.egui_input.modifiers, keycode) {
+                if let Some(contents) = self.clipboard.get() {
+                    let contents = contents.replace("\r\n", "\n");
+                    if !contents.is_empty() {
+                        self.egui_input.events.push(egui::Event::Paste(contents));
                     }
                 }
             }
+        }
 
-            if let Some(key) = translate_virtual_key_code(keycode) {
-                self.egui_input.events.push(egui::Event::Key {
-                    key,
-                    pressed,
-                    modifiers: self.egui_input.modifiers,
-                });
-            }
+        if let Some(key) = translate_virtual_key_code(keycode) {
+            self.egui_input.events.push(egui::Event::Key {
+                key,
+                pressed,
+                modifiers: self.egui_input.modifiers,
+            });
         }
     }
 
@@ -541,25 +552,25 @@ fn is_printable_char(chr: char) -> bool {
     !is_in_private_use_area && !chr.is_ascii_control()
 }
 
-fn is_cut_command(modifiers: egui::Modifiers, keycode: winit::event::VirtualKeyCode) -> bool {
-    (modifiers.command && keycode == winit::event::VirtualKeyCode::X)
+fn is_cut_command(modifiers: egui::Modifiers, keycode: winit::keyboard::Key<'static>) -> bool {
+    (modifiers.command && keycode == winit::keyboard::Key::Character("x"))
         || (cfg!(target_os = "windows")
             && modifiers.shift
-            && keycode == winit::event::VirtualKeyCode::Delete)
+            && keycode == winit::keyboard::Key::Delete)
 }
 
-fn is_copy_command(modifiers: egui::Modifiers, keycode: winit::event::VirtualKeyCode) -> bool {
-    (modifiers.command && keycode == winit::event::VirtualKeyCode::C)
+fn is_copy_command(modifiers: egui::Modifiers, keycode: winit::keyboard::Key<'static>) -> bool {
+    (modifiers.command && keycode == winit::keyboard::Key::Character("c"))
         || (cfg!(target_os = "windows")
             && modifiers.ctrl
-            && keycode == winit::event::VirtualKeyCode::Insert)
+            && keycode == winit::keyboard::Key::Insert)
 }
 
-fn is_paste_command(modifiers: egui::Modifiers, keycode: winit::event::VirtualKeyCode) -> bool {
-    (modifiers.command && keycode == winit::event::VirtualKeyCode::V)
+fn is_paste_command(modifiers: egui::Modifiers, keycode: winit::keyboard::Key<'static>) -> bool {
+    (modifiers.command && keycode == winit::keyboard::Key::Character("v"))
         || (cfg!(target_os = "windows")
             && modifiers.shift
-            && keycode == winit::event::VirtualKeyCode::Insert)
+            && keycode == winit::keyboard::Key::Insert)
 }
 
 fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::PointerButton> {
@@ -573,87 +584,87 @@ fn translate_mouse_button(button: winit::event::MouseButton) -> Option<egui::Poi
     }
 }
 
-fn translate_virtual_key_code(key: winit::event::VirtualKeyCode) -> Option<egui::Key> {
+fn translate_virtual_key_code(key: winit::keyboard::Key<'static>) -> Option<egui::Key> {
     use egui::Key;
-    use winit::event::VirtualKeyCode;
+    use winit::keyboard::Key as WinitKey;
 
     Some(match key {
-        VirtualKeyCode::Down => Key::ArrowDown,
-        VirtualKeyCode::Left => Key::ArrowLeft,
-        VirtualKeyCode::Right => Key::ArrowRight,
-        VirtualKeyCode::Up => Key::ArrowUp,
+        WinitKey::ArrowDown => Key::ArrowDown,
+        WinitKey::ArrowLeft => Key::ArrowLeft,
+        WinitKey::ArrowRight => Key::ArrowRight,
+        WinitKey::ArrowUp => Key::ArrowUp,
 
-        VirtualKeyCode::Escape => Key::Escape,
-        VirtualKeyCode::Tab => Key::Tab,
-        VirtualKeyCode::Back => Key::Backspace,
-        VirtualKeyCode::Return => Key::Enter,
-        VirtualKeyCode::Space => Key::Space,
+        WinitKey::Escape => Key::Escape,
+        WinitKey::Tab => Key::Tab,
+        WinitKey::Backspace => Key::Backspace,
+        WinitKey::Enter => Key::Enter,
+        WinitKey::Space => Key::Space,
 
-        VirtualKeyCode::Insert => Key::Insert,
-        VirtualKeyCode::Delete => Key::Delete,
-        VirtualKeyCode::Home => Key::Home,
-        VirtualKeyCode::End => Key::End,
-        VirtualKeyCode::PageUp => Key::PageUp,
-        VirtualKeyCode::PageDown => Key::PageDown,
+        WinitKey::Insert => Key::Insert,
+        WinitKey::Delete => Key::Delete,
+        WinitKey::Home => Key::Home,
+        WinitKey::End => Key::End,
+        WinitKey::PageUp => Key::PageUp,
+        WinitKey::PageDown => Key::PageDown,
 
-        VirtualKeyCode::Key0 | VirtualKeyCode::Numpad0 => Key::Num0,
-        VirtualKeyCode::Key1 | VirtualKeyCode::Numpad1 => Key::Num1,
-        VirtualKeyCode::Key2 | VirtualKeyCode::Numpad2 => Key::Num2,
-        VirtualKeyCode::Key3 | VirtualKeyCode::Numpad3 => Key::Num3,
-        VirtualKeyCode::Key4 | VirtualKeyCode::Numpad4 => Key::Num4,
-        VirtualKeyCode::Key5 | VirtualKeyCode::Numpad5 => Key::Num5,
-        VirtualKeyCode::Key6 | VirtualKeyCode::Numpad6 => Key::Num6,
-        VirtualKeyCode::Key7 | VirtualKeyCode::Numpad7 => Key::Num7,
-        VirtualKeyCode::Key8 | VirtualKeyCode::Numpad8 => Key::Num8,
-        VirtualKeyCode::Key9 | VirtualKeyCode::Numpad9 => Key::Num9,
+        WinitKey::Character("0") => Key::Num0,
+        WinitKey::Character("1") => Key::Num1,
+        WinitKey::Character("2") => Key::Num2,
+        WinitKey::Character("3") => Key::Num3,
+        WinitKey::Character("4") => Key::Num4,
+        WinitKey::Character("5") => Key::Num5,
+        WinitKey::Character("6") => Key::Num6,
+        WinitKey::Character("7") => Key::Num7,
+        WinitKey::Character("8") => Key::Num8,
+        WinitKey::Character("9") => Key::Num9,
 
-        VirtualKeyCode::A => Key::A,
-        VirtualKeyCode::B => Key::B,
-        VirtualKeyCode::C => Key::C,
-        VirtualKeyCode::D => Key::D,
-        VirtualKeyCode::E => Key::E,
-        VirtualKeyCode::F => Key::F,
-        VirtualKeyCode::G => Key::G,
-        VirtualKeyCode::H => Key::H,
-        VirtualKeyCode::I => Key::I,
-        VirtualKeyCode::J => Key::J,
-        VirtualKeyCode::K => Key::K,
-        VirtualKeyCode::L => Key::L,
-        VirtualKeyCode::M => Key::M,
-        VirtualKeyCode::N => Key::N,
-        VirtualKeyCode::O => Key::O,
-        VirtualKeyCode::P => Key::P,
-        VirtualKeyCode::Q => Key::Q,
-        VirtualKeyCode::R => Key::R,
-        VirtualKeyCode::S => Key::S,
-        VirtualKeyCode::T => Key::T,
-        VirtualKeyCode::U => Key::U,
-        VirtualKeyCode::V => Key::V,
-        VirtualKeyCode::W => Key::W,
-        VirtualKeyCode::X => Key::X,
-        VirtualKeyCode::Y => Key::Y,
-        VirtualKeyCode::Z => Key::Z,
+        WinitKey::Character("a") => Key::A,
+        WinitKey::Character("b") => Key::B,
+        WinitKey::Character("c") => Key::C,
+        WinitKey::Character("d") => Key::D,
+        WinitKey::Character("e") => Key::E,
+        WinitKey::Character("f") => Key::F,
+        WinitKey::Character("g") => Key::G,
+        WinitKey::Character("h") => Key::H,
+        WinitKey::Character("i") => Key::I,
+        WinitKey::Character("j") => Key::J,
+        WinitKey::Character("k") => Key::K,
+        WinitKey::Character("l") => Key::L,
+        WinitKey::Character("m") => Key::M,
+        WinitKey::Character("n") => Key::N,
+        WinitKey::Character("o") => Key::O,
+        WinitKey::Character("p") => Key::P,
+        WinitKey::Character("q") => Key::Q,
+        WinitKey::Character("r") => Key::R,
+        WinitKey::Character("s") => Key::S,
+        WinitKey::Character("t") => Key::T,
+        WinitKey::Character("u") => Key::U,
+        WinitKey::Character("v") => Key::V,
+        WinitKey::Character("w") => Key::W,
+        WinitKey::Character("x") => Key::X,
+        WinitKey::Character("y") => Key::Y,
+        WinitKey::Character("z") => Key::Z,
 
-        VirtualKeyCode::F1 => Key::F1,
-        VirtualKeyCode::F2 => Key::F2,
-        VirtualKeyCode::F3 => Key::F3,
-        VirtualKeyCode::F4 => Key::F4,
-        VirtualKeyCode::F5 => Key::F5,
-        VirtualKeyCode::F6 => Key::F6,
-        VirtualKeyCode::F7 => Key::F7,
-        VirtualKeyCode::F8 => Key::F8,
-        VirtualKeyCode::F9 => Key::F9,
-        VirtualKeyCode::F10 => Key::F10,
-        VirtualKeyCode::F11 => Key::F11,
-        VirtualKeyCode::F12 => Key::F12,
-        VirtualKeyCode::F13 => Key::F13,
-        VirtualKeyCode::F14 => Key::F14,
-        VirtualKeyCode::F15 => Key::F15,
-        VirtualKeyCode::F16 => Key::F16,
-        VirtualKeyCode::F17 => Key::F17,
-        VirtualKeyCode::F18 => Key::F18,
-        VirtualKeyCode::F19 => Key::F19,
-        VirtualKeyCode::F20 => Key::F20,
+        WinitKey::F1 => Key::F1,
+        WinitKey::F2 => Key::F2,
+        WinitKey::F3 => Key::F3,
+        WinitKey::F4 => Key::F4,
+        WinitKey::F5 => Key::F5,
+        WinitKey::F6 => Key::F6,
+        WinitKey::F7 => Key::F7,
+        WinitKey::F8 => Key::F8,
+        WinitKey::F9 => Key::F9,
+        WinitKey::F10 => Key::F10,
+        WinitKey::F11 => Key::F11,
+        WinitKey::F12 => Key::F12,
+        WinitKey::F13 => Key::F13,
+        WinitKey::F14 => Key::F14,
+        WinitKey::F15 => Key::F15,
+        WinitKey::F16 => Key::F16,
+        WinitKey::F17 => Key::F17,
+        WinitKey::F18 => Key::F18,
+        WinitKey::F19 => Key::F19,
+        WinitKey::F20 => Key::F20,
 
         _ => {
             return None;
